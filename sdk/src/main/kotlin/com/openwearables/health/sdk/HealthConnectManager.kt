@@ -117,53 +117,82 @@ class HealthConnectManager(
     override suspend fun requestAuthorization(typeIds: List<String>): Boolean {
         trackedTypeIds = typeIds.filter { mapToRecordClass(it) != null }.toSet()
 
-        val permissions = typeIds.mapNotNull { typeId ->
+        val dataPermissions = typeIds.mapNotNull { typeId ->
             mapToRecordClass(typeId)?.let { HealthPermission.getReadPermission(it) }
         }.toMutableSet()
 
-        if (permissions.isEmpty()) {
+        if (dataPermissions.isEmpty()) {
             logger("No valid Health Connect types to authorize")
             return false
         }
 
-        permissions.add(HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
+        // Do NOT bundle READ_HEALTH_DATA_IN_BACKGROUND into the first dialog.
+        // On Samsung / some HC builds, including that restricted permission cancels
+        // the whole request instantly (empty grant set, no visible sheet).
+        val backgroundPermission = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND
 
         if (client == null && !connect()) return false
         val hcClient = client ?: return false
 
         val alreadyGranted = hcClient.permissionController.getGrantedPermissions()
-        val needed = permissions - alreadyGranted
-        if (needed.isEmpty()) {
-            logger("All ${permissions.size} Health Connect permissions already granted (including background read)")
-            return true
+        logger("HC already granted ${alreadyGranted.size} perms")
+
+        val dataNeeded = dataPermissions - alreadyGranted
+        if (dataNeeded.isNotEmpty()) {
+            val launcher = permissionLauncher
+            if (launcher == null) {
+                logger("Permission launcher not registered — cannot request HC permissions")
+                return false
+            }
+            try {
+                val deferred = CompletableDeferred<Set<String>>()
+                pendingPermissionResult = deferred
+                logger("Launching Health Connect permission dialog for ${dataNeeded.size} data permissions (no background)")
+                logger("Requesting: ${dataNeeded.joinToString()}")
+                launcher.launch(dataNeeded)
+                val granted = deferred.await()
+                pendingPermissionResult = null
+                logger("HC dialog returned ${granted.size} grants: ${granted.joinToString()}")
+                val totalGranted = alreadyGranted + granted
+                val dataPermsGranted = dataPermissions.all { it in totalGranted }
+                if (!dataPermsGranted) {
+                    logger("Data permissions: some missing")
+                    return false
+                }
+                logger("Data permissions: all granted")
+            } catch (e: Exception) {
+                logger("Health Connect permission request failed: ${e.message}")
+                pendingPermissionResult = null
+                return false
+            }
+        } else {
+            logger("All ${dataPermissions.size} Health Connect data permissions already granted")
         }
 
-        val launcher = permissionLauncher
-        if (launcher == null) {
-            logger("Permission launcher not registered — cannot request HC permissions")
-            return false
+        // Best-effort background read (optional). Failure must not fail connect.
+        val afterData = hcClient.permissionController.getGrantedPermissions()
+        if (backgroundPermission !in afterData) {
+            val launcher = permissionLauncher
+            if (launcher != null) {
+                try {
+                    val deferred = CompletableDeferred<Set<String>>()
+                    pendingPermissionResult = deferred
+                    logger("Requesting optional background health read permission")
+                    launcher.launch(setOf(backgroundPermission))
+                    val granted = deferred.await()
+                    pendingPermissionResult = null
+                    val bgOk = backgroundPermission in (afterData + granted)
+                    logger("Background read: ${if (bgOk) "granted" else "NOT granted (sync will be foreground-only)"}")
+                } catch (e: Exception) {
+                    pendingPermissionResult = null
+                    logger("Background read request failed (ignored): ${e.message}")
+                }
+            }
+        } else {
+            logger("Background read: already granted")
         }
 
-        return try {
-            val deferred = CompletableDeferred<Set<String>>()
-            pendingPermissionResult = deferred
-
-            logger("Launching Health Connect permission dialog for ${needed.size} permissions (includes background read)")
-            launcher.launch(needed)
-
-            val granted = deferred.await()
-            pendingPermissionResult = null
-
-            val totalGranted = alreadyGranted + granted
-            val bgGranted = HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND in totalGranted
-            val dataPermsGranted = (permissions - HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND).all { it in totalGranted }
-            logger("Data permissions: ${if (dataPermsGranted) "all granted" else "some missing"}, background read: ${if (bgGranted) "granted" else "NOT granted"}")
-            dataPermsGranted
-        } catch (e: Exception) {
-            logger("Health Connect permission request failed: ${e.message}")
-            pendingPermissionResult = null
-            false
-        }
+        return true
     }
 
     // -----------------------------------------------------------------------
