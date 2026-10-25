@@ -1,7 +1,9 @@
 package com.openwearables.health.sdk
 
 import android.content.Context
+import android.os.SystemClock
 import androidx.work.*
+import kotlinx.coroutines.delay
 
 /**
  * WorkManager worker for background health data synchronization.
@@ -17,11 +19,14 @@ class HealthSyncWorker(
     companion object {
         const val KEY_HOST = "host"
         const val KEY_CUSTOM_SYNC_URL = "customSyncUrl"
+        /** Keep health FGS notification visible long enough for users / Play demos. */
+        private const val MIN_FOREGROUND_MS = 5_000L
     }
 
     override suspend fun doWork(): Result {
         val host = inputData.getString(KEY_HOST) ?: return Result.failure()
         val customSyncUrl = inputData.getString(KEY_CUSTOM_SYNC_URL)
+        val startedAt = SystemClock.elapsedRealtime()
 
         try {
             setForeground(getForegroundInfo())
@@ -37,7 +42,7 @@ class HealthSyncWorker(
             { android.util.Log.d("HealthSyncWorker", it) }
         )
 
-        return try {
+        val result = try {
             val trackedTypes = secureStorage.getTrackedTypes()
             provider.setTrackedTypes(trackedTypes)
 
@@ -49,6 +54,12 @@ class HealthSyncWorker(
             android.util.Log.e("HealthSyncWorker", "Sync failed", e)
             Result.retry()
         }
+
+        val elapsed = SystemClock.elapsedRealtime() - startedAt
+        if (elapsed < MIN_FOREGROUND_MS) {
+            delay(MIN_FOREGROUND_MS - elapsed)
+        }
+        return result
     }
 
     private fun createProvider(
@@ -71,8 +82,9 @@ class HealthSyncWorker(
             .setContentTitle(secureStorage.getNotificationTitle())
             .setContentText(secureStorage.getNotificationText())
             .setSmallIcon(android.R.drawable.ic_popup_sync)
-            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_DEFAULT)
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
             .build()
         return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
             ForegroundInfo(NotificationConfig.NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
@@ -83,13 +95,18 @@ class HealthSyncWorker(
 
     private fun createNotificationChannel() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            // Recreate if an older LOW-importance channel was cached (OEM hides those)
+            val existing = nm.getNotificationChannel(NotificationConfig.CHANNEL_ID)
+            if (existing != null && existing.importance < android.app.NotificationManager.IMPORTANCE_DEFAULT) {
+                nm.deleteNotificationChannel(NotificationConfig.CHANNEL_ID)
+            }
             val channel = android.app.NotificationChannel(
                 NotificationConfig.CHANNEL_ID,
                 NotificationConfig.CHANNEL_NAME,
-                android.app.NotificationManager.IMPORTANCE_LOW
+                android.app.NotificationManager.IMPORTANCE_DEFAULT
             ).apply { description = NotificationConfig.CHANNEL_DESCRIPTION }
-            (applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager)
-                .createNotificationChannel(channel)
+            nm.createNotificationChannel(channel)
         }
     }
 }
